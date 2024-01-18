@@ -372,6 +372,56 @@ impl Task for YoloV8Pose {
     }
 }
 
+fn process_a_image<T: Task>(image_name: &str, device: &Device, model: &impl Task,confidence_threshold: f32, nms_threshold: f32, legend_size: u32) -> anyhow::Result<()> {
+    println!("processing {image_name}");
+    let mut image_name = std::path::PathBuf::from(image_name);
+    let original_image = image::io::Reader::open(&image_name)?
+        .decode()
+        .map_err(candle::Error::wrap)?;
+    let (width, height) = {
+        let w = original_image.width() as usize;
+        let h = original_image.height() as usize;
+        if w < h {
+            let w = w * 640 / h;
+            // Sizes have to be divisible by 32.
+            (w / 32 * 32, 640)
+        } else {
+            let h = h * 640 / w;
+            (640, h / 32 * 32)
+        }
+    };
+    let image_t = {
+        let img = original_image.resize_exact(
+            width as u32,
+            height as u32,
+            image::imageops::FilterType::CatmullRom,
+        );
+        let data = img.to_rgb8().into_raw();
+        Tensor::from_vec(
+            data,
+            (img.height() as usize, img.width() as usize, 3),
+            device,
+        )?
+        .permute((2, 0, 1))?
+    };
+    let image_t = (image_t.unsqueeze(0)?.to_dtype(DType::F32)? * (1. / 255.))?;
+    let predictions = model.forward(&image_t)?.squeeze(0)?;
+    println!("generated predictions {predictions:?}");
+    let image_t = T::report(
+        &predictions,
+        original_image,
+        width,
+        height,
+        confidence_threshold,
+        nms_threshold,
+        legend_size,
+    )?;
+    image_name.set_extension("pp.jpg");
+    println!("writing {image_name:?}");
+    image_t.save(image_name)?;
+    Ok(())
+}
+
 pub fn run<T: Task>(args: Args) -> anyhow::Result<()> {
     let device = candle_examples::device(args.cpu)?;
     // Create the model and load the weights from the file.
@@ -385,54 +435,25 @@ pub fn run<T: Task>(args: Args) -> anyhow::Result<()> {
     let model = args.model()?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model], DType::F32, &device)? };
     let model = T::load(vb, multiples)?;
-    println!("model loaded");
-    for image_name in args.images.iter() {
-        println!("processing {image_name}");
-        let mut image_name = std::path::PathBuf::from(image_name);
-        let original_image = image::io::Reader::open(&image_name)?
-            .decode()
-            .map_err(candle::Error::wrap)?;
-        let (width, height) = {
-            let w = original_image.width() as usize;
-            let h = original_image.height() as usize;
-            if w < h {
-                let w = w * 640 / h;
-                // Sizes have to be divisible by 32.
-                (w / 32 * 32, 640)
-            } else {
-                let h = h * 640 / w;
-                (640, h / 32 * 32)
+
+    // if args.images is a directory, process all the .jpg files in it.
+    let mut args = args;
+    if let Some(path) = args.images.get(0) {
+        if std::path::Path::new(path).is_dir() {
+            let mut images = vec![];
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map(|x| x == "jpg").unwrap_or(false) {
+                    images.push(path.to_string_lossy().to_string());
+                }
             }
-        };
-        let image_t = {
-            let img = original_image.resize_exact(
-                width as u32,
-                height as u32,
-                image::imageops::FilterType::CatmullRom,
-            );
-            let data = img.to_rgb8().into_raw();
-            Tensor::from_vec(
-                data,
-                (img.height() as usize, img.width() as usize, 3),
-                &device,
-            )?
-            .permute((2, 0, 1))?
-        };
-        let image_t = (image_t.unsqueeze(0)?.to_dtype(DType::F32)? * (1. / 255.))?;
-        let predictions = model.forward(&image_t)?.squeeze(0)?;
-        println!("generated predictions {predictions:?}");
-        let image_t = T::report(
-            &predictions,
-            original_image,
-            width,
-            height,
-            args.confidence_threshold,
-            args.nms_threshold,
-            args.legend_size,
-        )?;
-        image_name.set_extension("pp.jpg");
-        println!("writing {image_name:?}");
-        image_t.save(image_name)?
+            args.images = images;
+        }
+    }
+
+    for image_name in args.images.iter() {
+        process_a_image::<T>(image_name, &device, &model, args.confidence_threshold, args.nms_threshold, args.legend_size)?;
     }
 
     Ok(())
